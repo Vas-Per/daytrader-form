@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>PAPER orders form</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+body{font:16px system-ui;margin:16px;background:var(--tg-theme-bg-color,#fff);color:var(--tg-theme-text-color,#222)}
+h1{font-size:1.4rem}table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:10px 3px;border-bottom:1px solid var(--tg-theme-hint-color,#aaa)}
+small{display:block;color:var(--tg-theme-hint-color,#666)}.choices{display:flex;flex-wrap:wrap;gap:4px;margin:10px 0}.choices label{padding:8px;border:1px solid var(--tg-theme-hint-color,#aaa);border-radius:6px}
+.fields{display:flex;gap:8px;flex-wrap:wrap}.fields label{flex:1;min-width:80px}input[type=text]{box-sizing:border-box;width:100%;padding:10px;background:var(--tg-theme-secondary-bg-color,#eee);color:inherit;border:1px solid var(--tg-theme-hint-color,#aaa);border-radius:6px}
+.warning,#error{color:var(--tg-theme-destructive-text-color,#b33)}[hidden]{display:none!important}#error{white-space:pre-line}main{padding-bottom:40px}
+</style>
+</head><body><main><h1>PAPER orders form</h1><p id="notice">Open the 📝 Orders form button in your bot's private chat.</p><div id="content" hidden><p id="deadline"></p><p>Hypothetical records only. No order is placed. The bot confirms within the hour.</p><table><thead><tr><th>Symbol / side</th><th>Planned shares</th><th>Reference (USD)</th></tr></thead><tbody id="orders"></tbody></table><p>Choose Bought after trading by hand in Revolut. Blank means no change. Price and fee are in USD.</p><p id="error" role="alert"></p></div></main>
+<script>
+'use strict';
+const app = window.Telegram && window.Telegram.WebApp;
+const node = (tag, text) => { const el = document.createElement(tag); if (text !== undefined) el.textContent = text; return el; };
+const error = document.getElementById('error');
+try {
+  const d = new URLSearchParams(location.search).get('d');
+  if (!app || !app.platform || app.platform === 'unknown' || !d) throw Error('Open the 📝 Orders form button in your bot’s private chat.');
+  const bytes = Uint8Array.from(atob(d.replace(/-/g,'+').replace(/_/g,'/') + '='.repeat((4-d.length%4)%4)), c => c.charCodeAt(0));
+  const payload = JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));
+  const positive = n => typeof n === 'number' && Number.isFinite(n) && n > 0;
+  if (payload.v !== 1 || typeof payload.deadline !== 'string' || !Number.isFinite(Date.parse(payload.deadline)) || !Array.isArray(payload.orders) || !payload.orders.length || payload.orders.length > 50) throw Error('Invalid form link. Reopen the latest Orders form button.');
+  const ids = new Set();
+  for (const o of payload.orders) {
+    if (!Number.isSafeInteger(o.id) || ids.has(o.id) || !['buy','sell'].includes(o.side) || typeof o.sym !== 'string' || !o.sym || !positive(o.qty) || !positive(o.ref) || !['PENDING','TAKEN'].includes(o.status)) throw Error('Invalid form link.');
+    ids.add(o.id);
+  }
+  document.getElementById('notice').hidden = true;
+  document.getElementById('content').hidden = false;
+  document.getElementById('deadline').textContent = 'Take deadline: ' + new Date(payload.deadline).toLocaleString('en-US', {timeZone:'America/New_York'}) + ' ET. Already taken orders can be filled later.';
+  const controls = [];
+  for (const o of payload.orders) {
+    const tr = node('tr');
+    tr.append(node('td', o.sym + ' · ' + o.side.toUpperCase()), node('td', String(o.qty)), node('td', '$' + o.ref));
+    const detail = node('tr'), cell = node('td'); cell.colSpan = 3;
+    const choices = node('div'); choices.className = 'choices';
+    const fields = node('div'); fields.className = 'fields'; fields.hidden = true;
+    const control = {o, a:'', inputs:{}};
+    const options = [['','No change'],['bought','Bought'], ...(o.status === 'PENDING' ? [['skip','Skip'],['unavailable','Not available']] : [])];
+    for (const [value,label] of options) {
+      const wrap = node('label'), input = node('input'); input.type = 'radio'; input.name = 'decision' + o.id; input.value = value; input.checked = value === '';
+      input.addEventListener('change', () => {control.a = value; fields.hidden = value !== 'bought'; refresh();});
+      wrap.append(input, document.createTextNode(label)); choices.append(wrap);
+    }
+    for (const [key,label,value] of [['p','Price',''],['q','Shares',String(o.qty)],['f','Fee','0']]) {
+      const wrap = node('label',label), input = node('input'); input.type = 'text'; input.inputMode = 'decimal'; input.value = value; input.autocomplete = 'off';
+      input.required = true; input.addEventListener('input', refresh); control.inputs[key] = input; wrap.append(input); fields.append(wrap);
+    }
+    control.warning = node('p'); control.warning.className = 'warning';
+    cell.append(choices,fields,control.warning); detail.append(cell); document.getElementById('orders').append(tr,detail); controls.push(control);
+  }
+  function build() {
+    const rows = [], problems = [];
+    for (const c of controls) {
+      c.warning.textContent = '';
+      if (!c.a) continue;
+      const row = {id:c.o.id,a:c.a};
+      if (c.a === 'bought') {
+        for (const key of ['p','q','f']) {
+          const text = c.inputs[key].value.trim().replace(',','.');
+          const n = text === '' ? NaN : Number(text);
+          row[key] = n;
+          if (!Number.isFinite(n) || (key === 'f' ? n < 0 : n <= 0)) problems.push(c.o.sym + ': enter a valid ' + ({p:'price',q:'share quantity',f:'fee'})[key]);
+        }
+        if (row.q > c.o.qty) problems.push(c.o.sym + ': shares exceed planned quantity');
+        if (Number.isFinite(row.p) && Math.abs(row.p/c.o.ref-1) > .25) {
+          c.warning.textContent = 'Price is outside ±25% of reference. Check the USD price; the bot will reject it.';
+          problems.push(c.o.sym + ': check price against reference');
+        }
+      }
+      rows.push(row);
+    }
+    const text = JSON.stringify({v:1,rows});
+    if (new TextEncoder().encode(text).length > 4096) problems.push('Submission too large. Select fewer rows.');
+    return {rows,text,problems};
+  }
+  function refresh() {
+    const {rows,problems} = build(); error.textContent = problems.join('\n');
+    app.MainButton.setText('Submit (' + rows.length + ')');
+    if (rows.length && !problems.length) app.MainButton.enable(); else app.MainButton.disable();
+  }
+  app.ready(); app.expand(); app.MainButton.show(); refresh();
+  app.MainButton.onClick(() => {
+    const {rows,text,problems} = build();
+    if (!rows.length || problems.length) {refresh(); return;}
+    try { app.sendData(text); app.MainButton.disable(); }
+    catch (_) {error.textContent = 'Could not submit. Reopen the form from the private chat.';}
+  });
+} catch (e) {
+  document.getElementById('notice').textContent = e.message || 'Invalid form link.';
+  document.getElementById('notice').hidden = false;
+  document.getElementById('content').hidden = true;
+  if (app) app.MainButton.hide();
+}
+</script></body></html>
